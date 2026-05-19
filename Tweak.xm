@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Security/SecureTransport.h>
+#import <Block.h>
 #import <substrate.h>
 #import "fishhook.h"
 #import "GTExtraContext.h"
@@ -51,6 +52,8 @@ static BOOL gEnableSendHooks = YES;
 static BOOL gEnableRecvHooks = YES;
 static BOOL gEnableSendtoHooks = YES;
 static BOOL gEnableRecvfromHooks = YES;
+static BOOL gEnableExtendedPayloadCapture = YES;
+static size_t gExtendedPayloadCaptureLimit = 4096;
 
 // Toggle these flags directly, then rebuild and reinstall.
 // Recommended debug order:
@@ -95,6 +98,9 @@ static ssize_t hook_send_fish(int fd, const void *buf, size_t len, int flags);
 static ssize_t hook_recv_fish(int fd, void *buf, size_t len, int flags);
 static ssize_t hook_sendto_fish(int fd, const void *buf, size_t len, int flags, const struct sockaddr *addr, socklen_t addrlen);
 static ssize_t hook_recvfrom_fish(int fd, void *buf, size_t len, int flags, struct sockaddr *addr, socklen_t *addrlen);
+static NSMutableDictionary *gt_ensure_nw_conn(void *conn);
+static NSDictionary *gt_preview_from_dispatch_data(dispatch_data_t data);
+static void gt_emit_log(NSString *layer, NSString *event, NSString *connID, const void *data, size_t len, BOOL includeStack, NSDictionary *extra);
 
 static uint64_t gt_now_ms(void) {
     struct timeval tv;
@@ -110,6 +116,13 @@ static uint64_t gt_tid(void) {
 
 static NSString *gt_ptr_string(const void *ptr) {
     return [NSString stringWithFormat:@"0x%llx", (unsigned long long)(uintptr_t)ptr];
+}
+
+static NSString *gt_nw_error_summary(id errorObj) {
+    if (!errorObj) {
+        return @"";
+    }
+    return [NSString stringWithFormat:@"%@", errorObj];
 }
 
 static NSString *gt_sanitize_path_component(NSString *text) {
@@ -170,6 +183,319 @@ static NSDictionary *gt_generate_preview(const void *buf, size_t len, size_t max
         [ascii appendFormat:@"%c", (b >= 32 && b <= 126) ? b : '.'];
     }
     return @{@"hex": hex, @"ascii": ascii};
+}
+
+static NSString *gt_ascii_string_from_bytes(const void *buf, size_t len) {
+    if (!buf || len == 0) {
+        return @"";
+    }
+
+    const uint8_t *bytes = (const uint8_t *)buf;
+    NSMutableString *ascii = [NSMutableString stringWithCapacity:len];
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = bytes[i];
+        [ascii appendFormat:@"%c", (b >= 32 && b <= 126) ? b : '.'];
+    }
+    return ascii;
+}
+
+static BOOL gt_bytes_start_with(const void *buf, size_t len, const char *prefix, size_t prefixLen) {
+    if (!buf || !prefix || len < prefixLen) {
+        return NO;
+    }
+    return memcmp(buf, prefix, prefixLen) == 0;
+}
+
+static BOOL gt_payload_is_gzip(const void *buf, size_t len) {
+    return gt_bytes_start_with(buf, len, "\x1f\x8b\x08", 3);
+}
+
+static NSDictionary *gt_generate_extended_payload_capture(const void *buf, size_t len, NSString *policy) {
+    if (!buf || len == 0) {
+        return @{};
+    }
+
+    size_t captureLen = MIN(len, gExtendedPayloadCaptureLimit);
+    NSData *data = [NSData dataWithBytes:buf length:captureLen];
+    return @{
+        @"payload_capture_policy": policy ?: @"extended",
+        @"payload_capture_len": @(captureLen),
+        @"payload_capture_truncated": @(captureLen < len),
+        @"payload_capture_b64": [data base64EncodedStringWithOptions:0] ?: @"",
+        @"payload_capture_ascii": gt_ascii_string_from_bytes(buf, captureLen) ?: @""
+    };
+}
+
+static NSString *gt_header_value(NSArray<NSString *> *lines, NSString *headerName) {
+    NSString *needle = [[headerName lowercaseString] stringByAppendingString:@":"];
+    for (NSString *line in lines) {
+        NSString *lower = [line lowercaseString];
+        if ([lower hasPrefix:needle]) {
+            NSString *value = [line substringFromIndex:needle.length];
+            return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        }
+    }
+    return nil;
+}
+
+static NSDictionary *gt_extract_http_metadata(const void *buf, size_t len) {
+    if (!buf || len == 0) {
+        return @{};
+    }
+
+    if (gt_bytes_start_with(buf, len, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24)) {
+        return @{
+            @"network_protocol_hint": @"http2_preface",
+            @"http_kind": @"request",
+            @"http2_client_preface": @YES
+        };
+    }
+
+    size_t scanLen = MIN(len, (size_t)8192);
+    NSString *text = [[NSString alloc] initWithBytes:buf length:scanLen encoding:NSISOLatin1StringEncoding];
+    if (text.length == 0) {
+        text = [[NSString alloc] initWithBytes:buf length:scanLen encoding:NSUTF8StringEncoding];
+    }
+    if (text.length == 0) {
+        return @{};
+    }
+
+    NSRange headerEndRange = [text rangeOfString:@"\r\n\r\n"];
+    NSString *headerText = headerEndRange.location != NSNotFound ? [text substringToIndex:headerEndRange.location] : text;
+    NSArray<NSString *> *lines = [headerText componentsSeparatedByString:@"\r\n"];
+    if (lines.count == 0) {
+        return @{};
+    }
+
+    NSString *firstLine = lines.firstObject ?: @"";
+    NSMutableDictionary *meta = [NSMutableDictionary dictionary];
+    if ([firstLine hasPrefix:@"HTTP/1."]) {
+        NSArray<NSString *> *parts = [firstLine componentsSeparatedByString:@" "];
+        meta[@"network_protocol_hint"] = @"http1";
+        meta[@"http_kind"] = @"response";
+        meta[@"http_version"] = parts.count > 0 ? parts[0] : @"";
+        if (parts.count > 1) {
+            meta[@"http_status_code"] = @([parts[1] integerValue]);
+        }
+        if (parts.count > 2) {
+            meta[@"http_reason"] = [[parts subarrayWithRange:NSMakeRange(2, parts.count - 2)] componentsJoinedByString:@" "];
+        }
+    } else {
+        NSArray<NSString *> *parts = [firstLine componentsSeparatedByString:@" "];
+        if (parts.count >= 3 &&
+            [parts[2] hasPrefix:@"HTTP/1."] &&
+            [parts[0] rangeOfCharacterFromSet:[[NSCharacterSet uppercaseLetterCharacterSet] invertedSet]].location == NSNotFound) {
+            meta[@"network_protocol_hint"] = @"http1";
+            meta[@"http_kind"] = @"request";
+            meta[@"http_method"] = parts[0];
+            meta[@"http_path"] = parts[1];
+            meta[@"http_version"] = parts[2];
+        }
+    }
+
+    if (meta.count == 0) {
+        return @{};
+    }
+
+    NSString *host = gt_header_value(lines, @"Host");
+    NSString *contentType = gt_header_value(lines, @"Content-Type");
+    NSString *contentEncoding = gt_header_value(lines, @"Content-Encoding");
+    NSString *userAgent = gt_header_value(lines, @"User-Agent");
+    NSString *accept = gt_header_value(lines, @"Accept");
+    NSString *contentLength = gt_header_value(lines, @"Content-Length");
+    if (host.length > 0) {
+        meta[@"http_host"] = host;
+    }
+    if (contentType.length > 0) {
+        meta[@"http_content_type"] = contentType;
+    }
+    if (contentEncoding.length > 0) {
+        meta[@"http_content_encoding"] = contentEncoding;
+    }
+    if (userAgent.length > 0) {
+        meta[@"http_user_agent"] = userAgent;
+    }
+    if (accept.length > 0) {
+        meta[@"http_accept"] = accept;
+    }
+    if (contentLength.length > 0) {
+        meta[@"http_content_length"] = @([contentLength integerValue]);
+    }
+    if (headerEndRange.location != NSNotFound) {
+        meta[@"http_body_offset"] = @(headerEndRange.location + 4);
+    }
+    return meta;
+}
+
+static void gt_update_nw_meta(void *conn, NSDictionary *updates) {
+    if (!conn || updates.count == 0) {
+        return;
+    }
+
+    NSString *key = gt_ptr_string(conn);
+    os_unfair_lock_lock(&gStateLock);
+    NSMutableDictionary *meta = gNwMap[key];
+    if (!meta) {
+        meta = [@{
+            @"nw_ptr": key,
+            @"ts": @(gt_now_ms()),
+            @"conn_id": [NSString stringWithFormat:@"nw_conn:%@", key]
+        } mutableCopy];
+        gNwMap[key] = meta;
+    }
+    [meta addEntriesFromDictionary:updates];
+    os_unfair_lock_unlock(&gStateLock);
+}
+
+static NSDictionary *gt_nw_meta_snapshot(void *conn) {
+    if (!conn) {
+        return @{};
+    }
+
+    NSString *key = gt_ptr_string(conn);
+    os_unfair_lock_lock(&gStateLock);
+    NSDictionary *meta = [gNwMap[key] copy] ?: @{};
+    os_unfair_lock_unlock(&gStateLock);
+    return meta;
+}
+
+static BOOL gt_nw_meta_requests_extended_capture(NSDictionary *meta) {
+    if (![meta[@"capture_full_payload"] boolValue]) {
+        return NO;
+    }
+    NSString *host = meta[@"http_host"];
+    NSString *path = meta[@"http_path"];
+    if (host.length == 0 && path.length == 0) {
+        return NO;
+    }
+    if ([host hasSuffix:@".meituan.net"] || [host hasSuffix:@".meituan.com"]) {
+        return YES;
+    }
+    if ([path containsString:@"/fetch?dm="] || [path containsString:@"/novel/gateway/index/mixer"]) {
+        return YES;
+    }
+    return NO;
+}
+
+static uint64_t gt_next_nw_receive_seq(void *conn, NSString *completionKey, BOOL isMessage) {
+    if (!conn) {
+        return 0;
+    }
+
+    NSString *key = gt_ptr_string(conn);
+    os_unfair_lock_lock(&gStateLock);
+    NSMutableDictionary *meta = gNwMap[key];
+    if (!meta) {
+        meta = [@{
+            @"nw_ptr": key,
+            @"ts": @(gt_now_ms()),
+            @"conn_id": [NSString stringWithFormat:@"nw_conn:%@", key]
+        } mutableCopy];
+        gNwMap[key] = meta;
+    }
+
+    uint64_t seq = [meta[@"receive_seq"] unsignedLongLongValue] + 1;
+    meta[@"receive_seq"] = @(seq);
+    meta[@"last_receive_seq"] = @(seq);
+    if (completionKey.length > 0) {
+        meta[@"last_receive_completion"] = completionKey;
+    }
+    meta[@"last_receive_kind"] = isMessage ? @"message" : @"stream";
+    os_unfair_lock_unlock(&gStateLock);
+    return seq;
+}
+
+static NSMutableDictionary *gt_nw_receive_extra_from_snapshot(NSDictionary *nwSnapshot) {
+    NSMutableDictionary *extra = [NSMutableDictionary dictionary];
+    NSArray<NSString *> *carryKeys = @[
+        @"http_host",
+        @"http_path",
+        @"http_method",
+        @"http_version",
+        @"http_content_type",
+        @"http_content_encoding",
+        @"http_content_length",
+        @"network_protocol_hint"
+    ];
+    for (NSString *key in carryKeys) {
+        id value = nwSnapshot[key];
+        if (value) {
+            extra[key] = value;
+        }
+    }
+    return extra;
+}
+
+typedef void (^gt_nw_receive_completion_block_t)(dispatch_data_t content, void *contextObj, BOOL isComplete, id errorObj);
+
+static void *gt_wrap_nw_receive_completion(void *conn,
+                                           uint64_t receiveSeq,
+                                           void *completion,
+                                           BOOL isMessage) {
+    if (!completion) {
+        return NULL;
+    }
+
+    NSDictionary *meta = gt_ensure_nw_conn(conn);
+    NSDictionary *nwSnapshot = gt_nw_meta_snapshot(conn);
+    NSString *connID = meta[@"conn_id"] ?: @"";
+    NSString *nwPtr = gt_ptr_string(conn);
+    NSString *completionKey = gt_ptr_string(completion);
+    gt_nw_receive_completion_block_t originalBlock = (__bridge gt_nw_receive_completion_block_t)_Block_copy(completion);
+
+    gt_nw_receive_completion_block_t wrapped = ^(dispatch_data_t content, void *contextObj, BOOL isComplete, id errorObj) {
+        NSDictionary *preview = gt_preview_from_dispatch_data(content);
+        const void *ptr = [preview[@"ptr"] pointerValue];
+        size_t len = [preview[@"len"] unsignedLongLongValue];
+
+        NSMutableDictionary *extra = [@{
+            @"nw_ptr": nwPtr,
+            @"receive_seq": @(receiveSeq),
+            @"completion": completionKey,
+            @"content_context": gt_ptr_string(contextObj),
+            @"is_complete": @(isComplete),
+            @"has_content": @((content != NULL)),
+            @"receive_kind": isMessage ? @"message" : @"stream"
+        } mutableCopy];
+
+        [extra addEntriesFromDictionary:gt_nw_receive_extra_from_snapshot(nwSnapshot)];
+
+        NSString *errorSummary = gt_nw_error_summary(errorObj);
+        if (errorSummary.length > 0) {
+            extra[@"error"] = errorSummary;
+            extra[@"has_error"] = @YES;
+        } else {
+            extra[@"has_error"] = @NO;
+        }
+
+        if (gEnableExtendedPayloadCapture && gt_nw_meta_requests_extended_capture(extra)) {
+            [extra addEntriesFromDictionary:gt_generate_extended_payload_capture(ptr, len, @"network_receive")];
+        }
+
+        gt_emit_log(@"network",
+                    isMessage ? @"nw_connection_receive_message_callback" : @"nw_connection_receive_callback",
+                    connID,
+                    ptr,
+                    len,
+                    YES,
+                    extra);
+
+        originalBlock(content, contextObj, isComplete, errorObj);
+    };
+
+    gt_nw_receive_completion_block_t copiedWrapped = (__bridge gt_nw_receive_completion_block_t)_Block_copy((__bridge const void *)wrapped);
+    return (__bridge void *)copiedWrapped;
+}
+
+static BOOL gt_tls_capture_candidate(const void *buf, size_t len) {
+    if (!buf || len == 0) {
+        return NO;
+    }
+    if (gt_payload_is_gzip(buf, len)) {
+        return YES;
+    }
+    NSDictionary *httpMeta = gt_extract_http_metadata(buf, len);
+    return httpMeta.count > 0;
 }
 
 static BOOL gt_is_noise_frame(NSString *imageName) {
@@ -530,7 +856,8 @@ static NSMutableDictionary *gt_ensure_nw_conn(void *conn) {
         meta = [@{
             @"nw_ptr": key,
             @"ts": @(gt_now_ms()),
-            @"conn_id": [NSString stringWithFormat:@"nw_conn:%@", key]
+            @"conn_id": [NSString stringWithFormat:@"nw_conn:%@", key],
+            @"receive_seq": @0
         } mutableCopy];
         gNwMap[key] = meta;
     }
@@ -627,7 +954,7 @@ static void gt_emit_log(NSString *layer, NSString *event, NSString *connID, cons
     }
 
     NSDictionary *preview = gEnablePayloadPreview
-        ? gt_generate_preview(data, len, 32)
+        ? gt_generate_preview(data, len, 256)
         : @{@"hex": @"", @"ascii": @""};
 
     NSMutableDictionary *payload = [@{
@@ -647,12 +974,21 @@ static void gt_emit_log(NSString *layer, NSString *event, NSString *connID, cons
     if (extra.count > 0) {
         [payload addEntriesFromDictionary:extra];
     }
+    if ([layer isEqualToString:@"network"] && data && len > 0) {
+        NSDictionary *httpMeta = gt_extract_http_metadata(data, len);
+        if (httpMeta.count > 0) {
+            [payload addEntriesFromDictionary:httpMeta];
+        }
+    }
     NSNumber *fdNumber = payload[@"fd"];
     if (fdNumber && [fdNumber isKindOfClass:[NSNumber class]]) {
         [payload addEntriesFromDictionary:GTSessionSnapshotForFD(gSessionMap, &gStateLock, fdNumber.intValue)];
     }
     if ([layer isEqualToString:@"tls"]) {
         [payload addEntriesFromDictionary:GTTLSAugmentPayload(payload, gTlsMap, gBoringSSLMap, gSessionMap, &gStateLock)];
+        if (gEnableExtendedPayloadCapture && gt_tls_capture_candidate(data, len)) {
+            [payload addEntriesFromDictionary:gt_generate_extended_payload_capture(data, len, @"tls_candidate")];
+        }
     }
     if (!payload[@"flow_id"] && payload[@"conn_id"]) {
         payload[@"flow_id"] = payload[@"conn_id"];
@@ -934,34 +1270,93 @@ static void hook_nw_connection_send(void *conn, void *content, void *contextObj,
     NSDictionary *preview = gt_preview_from_dispatch_data((__bridge dispatch_data_t)content);
     const void *ptr = [preview[@"ptr"] pointerValue];
     size_t len = [preview[@"len"] unsignedLongLongValue];
-    gt_emit_log(@"network", @"nw_connection_send", meta[@"conn_id"], ptr, len, YES, @{
+    NSMutableDictionary *extra = [@{
         @"nw_ptr": gt_ptr_string(conn),
         @"has_content": @((content != NULL)),
         @"is_complete": @(isComplete),
         @"content_context": gt_ptr_string(contextObj),
         @"completion": gt_ptr_string(completion)
-    });
+    } mutableCopy];
+
+    NSDictionary *httpMeta = gt_extract_http_metadata(ptr, len);
+    if (httpMeta.count > 0) {
+        [extra addEntriesFromDictionary:httpMeta];
+
+        NSMutableDictionary *metaUpdates = [NSMutableDictionary dictionaryWithDictionary:httpMeta];
+        metaUpdates[@"capture_full_payload"] = @YES;
+        gt_update_nw_meta(conn, metaUpdates);
+    }
+
+    NSDictionary *nwSnapshot = gt_nw_meta_snapshot(conn);
+    if (nwSnapshot.count > 0) {
+        NSArray<NSString *> *carryKeys = @[
+            @"http_host",
+            @"http_path",
+            @"http_method",
+            @"http_version",
+            @"http_content_type",
+            @"http_content_encoding",
+            @"http_content_length",
+            @"network_protocol_hint"
+        ];
+        for (NSString *key in carryKeys) {
+            id value = nwSnapshot[key];
+            if (value && !extra[key]) {
+                extra[key] = value;
+            }
+        }
+    }
+
+    if (gEnableExtendedPayloadCapture && gt_nw_meta_requests_extended_capture(extra)) {
+        [extra addEntriesFromDictionary:gt_generate_extended_payload_capture(ptr, len, @"network_whitelist")];
+    }
+
+    gt_emit_log(@"network", @"nw_connection_send", meta[@"conn_id"], ptr, len, YES, extra);
     orig_nw_connection_send(conn, content, contextObj, isComplete, completion);
 }
 
 static void hook_nw_connection_receive(void *conn, uint32_t minLen, uint32_t maxLen, void *completion) {
     NSDictionary *meta = gt_ensure_nw_conn(conn);
-    gt_emit_log(@"network", @"nw_connection_receive", meta[@"conn_id"], NULL, 0, YES, @{
+    NSString *completionKey = gt_ptr_string(completion);
+    uint64_t receiveSeq = gt_next_nw_receive_seq(conn, completionKey, NO);
+    NSMutableDictionary *extra = [@{
         @"nw_ptr": gt_ptr_string(conn),
         @"min_incomplete_length": @(minLen),
         @"max_length": @(maxLen),
-        @"completion": gt_ptr_string(completion)
-    });
-    orig_nw_connection_receive(conn, minLen, maxLen, completion);
+        @"completion": completionKey,
+        @"receive_seq": @(receiveSeq),
+        @"receive_kind": @"stream"
+    } mutableCopy];
+    NSDictionary *nwSnapshot = gt_nw_meta_snapshot(conn);
+    [extra addEntriesFromDictionary:gt_nw_receive_extra_from_snapshot(nwSnapshot)];
+    gt_emit_log(@"network", @"nw_connection_receive", meta[@"conn_id"], NULL, 0, YES, extra);
+
+    void *wrappedCompletion = gt_wrap_nw_receive_completion(conn, receiveSeq, completion, NO);
+    orig_nw_connection_receive(conn, minLen, maxLen, wrappedCompletion ?: completion);
+    if (wrappedCompletion) {
+        Block_release(wrappedCompletion);
+    }
 }
 
 static void hook_nw_connection_receive_message(void *conn, void *completion) {
     NSDictionary *meta = gt_ensure_nw_conn(conn);
-    gt_emit_log(@"network", @"nw_connection_receive_message", meta[@"conn_id"], NULL, 0, YES, @{
+    NSString *completionKey = gt_ptr_string(completion);
+    uint64_t receiveSeq = gt_next_nw_receive_seq(conn, completionKey, YES);
+    NSMutableDictionary *extra = [@{
         @"nw_ptr": gt_ptr_string(conn),
-        @"completion": gt_ptr_string(completion)
-    });
-    orig_nw_connection_receive_message(conn, completion);
+        @"completion": completionKey,
+        @"receive_seq": @(receiveSeq),
+        @"receive_kind": @"message"
+    } mutableCopy];
+    NSDictionary *nwSnapshot = gt_nw_meta_snapshot(conn);
+    [extra addEntriesFromDictionary:gt_nw_receive_extra_from_snapshot(nwSnapshot)];
+    gt_emit_log(@"network", @"nw_connection_receive_message", meta[@"conn_id"], NULL, 0, YES, extra);
+
+    void *wrappedCompletion = gt_wrap_nw_receive_completion(conn, receiveSeq, completion, YES);
+    orig_nw_connection_receive_message(conn, wrappedCompletion ?: completion);
+    if (wrappedCompletion) {
+        Block_release(wrappedCompletion);
+    }
 }
 
 static void gt_hook_symbol(const char *image, const char *symbol, void *replacement, void **original) {
