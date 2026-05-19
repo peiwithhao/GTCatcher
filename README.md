@@ -18,7 +18,7 @@
 ### 前提
 
 - 已有可用的 Theos 构建环境
-- 目标设备已越狱
+- 目标设备已越狱(已在ios 26.0上验证)
 - 目标设备支持 rootless 包安装
 - 设备已安装 `mobilesubstrate`
 
@@ -143,7 +143,7 @@ rg -n 'pid:[0-9]+\|fd:[0-9]+\|seq:[0-9]+\|' your.log
 
 仓库内已经有一份真实日志分析示例：
 
-- [skills/com.meituan.imeituan.traffic-report.md](/Users/peiwithhao/repo/GTCatcher/skills/com.meituan.imeituan.traffic-report.md)
+- [example/com.meituan.imeituan.traffic-report.md](./example/com.meituan.imeituan.traffic-report.md)
 
 ## 卸载
 
