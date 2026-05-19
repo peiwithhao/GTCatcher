@@ -1,11 +1,11 @@
 ---
 name: gtcatcher-traffic-report
-description: 分析 GTCatcher tweak 日志，尤其是 com.meituan.imeituan.log 这类真实应用日志，重建流量指纹、收发逻辑、跨层关联、协议轮廓，并基于当前仓库实际 hook 能力给出后续逆向建议。
+description: 分析任意 GTCatcher tweak 日志，重建流量指纹、收发逻辑、跨层关联、协议轮廓，并基于当前仓库实际 hook 能力输出通用、可复核的逆向分析报告，不依赖特定主机、域名或业务。
 ---
 
 # GTCatcher 流量分析报告
 
-当任务是阅读本仓库代码和真实 `GTCatcher` 日志，并输出一份严格、可复核的分析报告时，使用这个 skill。
+当任务是分析任意真实 `GTCatcher` 日志，并输出一份严格、可复核、与目标主机无关的分析报告时，使用这个 skill。
 
 适用目标：
 
@@ -16,15 +16,193 @@ description: 分析 GTCatcher tweak 日志，尤其是 com.meituan.imeituan.log 
 - 明确当前 hook 集合能证明什么、不能证明什么
 - 产出下一步更深入逆向的具体动作
 
-这个 skill 明确依赖当前仓库的实现细节，尤其是 [Tweak.xm](/Users/peiwithhao/repo/GTCatcher/Tweak.xm)、[GTExtraContext.m](/Users/peiwithhao/repo/GTCatcher/GTExtraContext.m) 和日志格式本身。不要把这类日志当成通用抓包或标准 pcap 来解释。
+这个 skill 已经内嵌了当前仓库实现的关键原理摘要，不要求每次重新阅读 `Tweak.xm`、`GTExtraContext.m`、`README.md` 才能开始分析。除非用户明确要求验证最新代码细节，否则应直接以本 skill 中的规则为准展开分析。
 
-## 先读哪些文件
+不要把这类日志当成通用抓包或标准 pcap 来解释。
 
-分析前先读：
+这个 skill 的目标是：
 
-- [README.md](/Users/peiwithhao/repo/GTCatcher/README.md)
-- [Tweak.xm](/Users/peiwithhao/repo/GTCatcher/Tweak.xm)
-- [GTExtraContext.m](/Users/peiwithhao/repo/GTCatcher/GTExtraContext.m)
+- 不预设目标域名、目标主机、目标端口、业务协议
+- 让分析逻辑完全由日志字段驱动
+- 遇到陌生主机、私有协议、非 HTTP 流量时也能输出高质量报告
+
+## 当前实现原理摘要
+
+下面这些结论已经来自当前仓库实现，可以直接作为分析前提使用。
+
+### 1. 日志的本质
+
+日志是 hook 级应用内遥测，不是链路抓包。
+
+每条 `[GTCatcher] {json}` 都表示：
+
+- 某个 hook 点在某个时间观察到的一次发送、接收、解密、加密或高层 API 调用
+- 它描述的是“调用点看到的数据”
+- 它不保证完整包、完整流、完整重组
+
+### 2. 三层 hook 模型
+
+当前实现同时观察三层：
+
+- BSD socket 层
+- TLS 明文层
+- Network.framework 高层 API
+
+它们对应的大致路径是：
+
+```text
+业务对象 / 序列化结果
+-> Network.framework 发送内容
+-> TLS 明文输入 / 输出
+-> BSD 层密文或自定义 framing 读写
+```
+
+但注意：
+
+- 这个路径在部分流上能成立
+- 并不是每条流都能完整打通三层
+- `network -> tls -> bsd` 的桥接在当前实现里仍不完全
+
+### 3. BSD 层当前如何工作
+
+BSD 层会 hook：
+
+- `connect`
+- `send`, `sendto`, `write`, `writev`, `sendmsg`
+- `recv`, `recvfrom`, `read`, `readv`, `recvmsg`
+
+BSD 层的最强主键是：
+
+- `flow_id`
+- `fd_conn_id`
+- `conn_id`
+
+连接建立后，一般长这样：
+
+```text
+pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
+```
+
+`bytes_in` / `bytes_out` 是 fd 会话累计计数，来自 hook 侧更新，不是严格的 TCP 流重组结果。
+
+### 4. TLS 层当前如何工作
+
+TLS 层同时覆盖两类实现：
+
+- SecureTransport
+  - `SSLWrite`
+  - `SSLRead`
+- BoringSSL / OpenSSL 风格
+  - `SSL_write`
+  - `SSL_read`
+  - 以及若干 fd / bio 关联路径
+
+如果 TLS 事件里出现这些字段：
+
+- `fd`
+- `fd_conn_id`
+- `flow_id`
+- `local`
+- `peer`
+
+说明当前 TLS 事件已经部分成功回填到 BSD 会话，可以优先并回 BSD 流。
+
+如果没有这些字段，就只能按：
+
+- `tls_conn_id`
+- 或 `conn_id`
+
+单独分组。
+
+### 5. Network.framework 层当前如何工作
+
+Network 层会记录：
+
+- `nw_connection_send`
+- `nw_connection_receive`
+- `nw_connection_receive_message`
+- `nw_connection_receive_callback`
+- `nw_connection_receive_message_callback`
+
+其中最关键的事实是：
+
+- `nw_connection_receive`
+  - 表示注册了一次 receive 请求
+- `nw_connection_receive_callback`
+  - 表示这次 receive 的 completion 真正触发了
+  - 可能带有响应内容
+
+因此新版日志里，`network` 层已经能直接看到一部分响应，而不只是请求。
+
+### 6. `receive_seq` 的真实含义
+
+当前实现会给每个 `nw_conn:*` 维护一个 `receive_seq`。
+
+它的作用是：
+
+- 第 N 次 `nw_connection_receive`
+- 对应第 N 次 `nw_connection_receive_callback`
+
+这只能证明“调用级配对”，不能自动证明“业务请求级配对”。
+
+尤其在：
+
+- HTTP/2
+- 多路复用
+- 长连接多轮交互
+
+场景下，不能把一个 callback 机械当成一个完整业务响应。
+
+### 7. HTTP 元数据是前缀解析结果
+
+当前实现会对可读前缀做 HTTP 元数据提取，因此日志里可能出现：
+
+- `http_method`
+- `http_path`
+- `http_host`
+- `http_version`
+- `http_content_type`
+- `http_content_encoding`
+- `http_status_code`
+- `http_reason`
+- `http_kind=request/response`
+
+这些字段的本质是：
+
+- 基于当前可见 payload 前缀解析得出
+- 很有价值
+- 但不等价于完整 HTTP 会话重组
+
+### 8. preview 与 payload_capture 的区别
+
+- `preview_hex` / `preview_ascii`
+  - 只是 payload 前缀预览
+- `payload_capture_*`
+  - 只在命中扩展捕获策略时出现
+  - 比 preview 更长，但仍未必是整条消息完整内容
+
+### 9. 栈聚类的意义
+
+`stack_hash` 是过滤噪音后的调用栈聚类键，用来回答：
+
+- 哪些流量来自同一调用路径
+- 哪些事件虽然目标不同，但其实由同一业务逻辑发起
+
+它尤其适合：
+
+- 发现批量上报
+- 发现某一类长连接
+- 发现相同序列化逻辑产生的多条流
+
+### 10. 当前实现的已知限制
+
+这些限制应默认成立：
+
+- 不能完成严格 TCP 重组
+- 不能把所有 `nw_conn:*` 精确映射回 BSD fd
+- 不能保证每条 TLS 都能成功映射到 fd
+- `preview_*` 不是完整 payload
+- `network` callback 虽然能看响应，但不等于自动完成请求-响应重组
 
 ## 当前 Tweak 实际会产出什么
 
@@ -81,6 +259,25 @@ description: 分析 GTCatcher tweak 日志，尤其是 com.meituan.imeituan.log 
 - `stack_hash` 是过滤噪音栈帧后得到的聚类键
 - `frames` 只有在启用栈采集且该 hook 选择 `includeStack=YES` 时才有
 - `network` 层的 callback 响应内容现在可见，但依旧不是“自动完成请求-响应语义重组”
+
+## 通用分析原则
+
+这个 skill 必须对未知主机、未知域名、未知协议也适用，因此：
+
+- 不要把特定样例中的域名、路径、IP、端口写死成规则
+- 不要把“像 HTTP”之外的流量视为低价值
+- 不要默认 443 就一定是标准 HTTPS
+- 不要默认 `sendto/recvfrom` 一定是 UDP 工具流，有些应用会在 datagram 上跑主业务
+- 不要默认可读 ASCII 前缀就代表完整业务协议明文
+- 不要因为看不到 HTTP 字段就忽略该流，二进制流同样要做时间线和指纹分析
+
+面对任意日志时，优先从这些维度抽象：
+
+- 目标集合：有哪些 peer / host / 端口
+- 传输风格：stream、message、datagram、长连接、短连接
+- 收发节奏：一次请求一次响应、流式、多轮握手、心跳、批量上报
+- 内容特征：HTTP、HTTP/2、JSON、gzip、二进制 framing、疑似 protobuf、疑似自定义协议
+- 跨层可见性：BSD only、TLS 明文可见、Network 明文可见、Network 响应可见
 
 ## 关联规则
 
@@ -233,6 +430,18 @@ pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
 
 这些都很有价值，但它们只证明前缀可见，不代表整个协议体都已完全掌握。
 
+### 5. 对未知协议必须给出结构化判断
+
+如果流量不是明显 HTTP / JSON，也必须说明：
+
+- 它是 `bsd only`、`tls plaintext` 还是 `network callback visible`
+- 首字节/首 32 字节是否稳定
+- 长度分布是否集中
+- 是否存在固定 framing 前缀
+- 是否像握手、心跳、批量推送、订阅流、文件下载、配置下发
+
+分析中允许写“无法确定协议”，但不允许停在“看不懂所以略过”。
+
 ## 建议工作流
 
 按这个顺序执行：
@@ -256,6 +465,12 @@ pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
 - 不同 `tls_conn_id` 数量
 - 不同 `nw_ptr` 数量
 - Top `stack_hash`
+
+如果目标主机很多，还应额外给出：
+
+- Top 远端 IP:port
+- Top `http_host`
+- Top “无 host 但高频的二进制流”
 
 ### 3. 分层分组
 
@@ -297,8 +512,8 @@ pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
 - 如何开始
 - 首次出站长什么样
 - 入站是立即响应、延迟响应还是流式回调
-- 看起来像请求/响应、持续流、保活、长连接还是本地 IPC
-- payload 看起来是明文、gzip、TLS 明文、还是二进制帧
+- 看起来像请求/响应、持续流、保活、长连接、文件下载还是本地 IPC
+- payload 看起来是明文、gzip、TLS 明文、HTTP/2、二进制帧、还是未知自定义协议
 
 ### 6. 做跨层关联
 
@@ -321,6 +536,13 @@ pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
 - 请求路径 / JSON key / HTTP 状态
 - 是否为 loopback、LAN、NTP、DNS、远程业务流
 
+如果是非 HTTP 流量，还要尝试给出：
+
+- 稳定 tag / magic bytes
+- 小包与大包的交替模式
+- 单向重流还是双向对称
+- 是否存在固定长度心跳
+
 ### 8. 写清楚硬限制
 
 必须明确：
@@ -337,12 +559,14 @@ pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
 
 优先建议示例：
 
-- 针对 `nw_connection_receive_callback` 命中的目标 Host 开启更长 payload 捕获
+- 针对 `nw_connection_receive_callback` 命中的高价值连接开启更长 payload 捕获
 - 给 BSD/TLS/Network 统一增加事件序号，减少人工时间线拼接成本
 - 继续桥接 `nw_connection` 到 fd / TLS ctx
 - 对 HTTP/2 连接增加 frame 头解析，提取 stream id
 - 围绕高价值 `stack_hash` 向上追业务序列化逻辑
 - 把同一 `nw_conn + receive_seq` 自动配对，输出结构化时间线
+- 对未知二进制流增加定向全量捕获与长度统计
+- 按 peer / host / stack_hash 自动挑选“最值得逆向的前 N 条流”
 
 ## 建议命令
 
@@ -351,41 +575,53 @@ pid:<pid>|fd:<fd>|seq:<n>|<local>-><peer>
 按层统计：
 
 ```sh
-rg -o '"layer":"[^"]+"' com.meituan.imeituan.log | sort | uniq -c
-rg -o '"event":"[^"]+"' com.meituan.imeituan.log | sort | uniq -c
+rg -o '"layer":"[^"]+"' your.log | sort | uniq -c
+rg -o '"event":"[^"]+"' your.log | sort | uniq -c
 ```
 
 查看新的 network callback：
 
 ```sh
-rg -n 'nw_connection_receive_callback|nw_connection_receive_message_callback' com.meituan.imeituan.log
+rg -n 'nw_connection_receive_callback|nw_connection_receive_message_callback' your.log
 ```
 
 查看某个 `nw_conn` 的收发和 callback：
 
 ```sh
-rg -n '"conn_id":"nw_conn:0x1175b6a80"|\"nw_ptr\":\"0x1175b6a80\"' com.meituan.imeituan.log
+rg -n '"conn_id":"nw_conn:0xDEADBEEF"|\"nw_ptr\":\"0xDEADBEEF\"' your.log
 ```
 
 查看某个 `receive_seq`：
 
 ```sh
-rg -n '"conn_id":"nw_conn:0x1175b6a80".*"receive_seq":2' com.meituan.imeituan.log
+rg -n '"conn_id":"nw_conn:0xDEADBEEF".*"receive_seq":2' your.log
 ```
 
-找业务路径：
+找可读请求/响应前缀：
 
 ```sh
-rg -n 'POST /|GET /|HTTP/1.1 200|PRI \* HTTP/2.0|novel/gateway/index/mixer' com.meituan.imeituan.log
+rg -n 'POST /|GET /|HTTP/1.1|PRI \* HTTP/2.0|Host: |Content-Type:' your.log
 ```
 
 找一个 BSD 流：
 
 ```sh
-rg -n 'pid:10078\\|fd:45\\|seq:1\\|192.168.64.25:53948->103.63.160.60:443' com.meituan.imeituan.log
+rg -n 'pid:[0-9]+\\|fd:[0-9]+\\|seq:[0-9]+\\|' your.log
 ```
 
 如果需要临时脚本，可以解析 `[GTCatcher] {json}` 后按 `flow_id`、`tls_conn_id`、`nw_conn + receive_seq` 输出时间线。除非用户要求复用工具，否则保持 task-local。
+
+## 不要写死样例结论
+
+这个 skill 不能假设：
+
+- 目标一定是某个 Meituan、QQ 或其他固定应用
+- 目标一定会出现 HTTP
+- 目标一定会有明文 Host / Path
+- 目标一定会走 TLS
+- 目标一定会走 `network` 层
+
+分析报告必须从当前日志实际出现的字段出发，而不是套用历史样例的结论。
 
 ## 输出契约
 
@@ -409,3 +645,5 @@ rg -n 'pid:10078\\|fd:45\\|seq:1\\|192.168.64.25:53948->103.63.160.60:443' com.m
 - 不要把 loopback、NTP、DNS、远程业务流混成一类
 - 如果模式看起来像应用协议，但 payload 仍截断，要明确写出“还需要什么额外捕获”
 - 遇到新版 `network` callback，必须说明它是“已收到响应”的证据，而不是旧版那种“只注册 receive”
+- 即使目标主机、域名、协议完全陌生，也要完成 inventory、timeline、fingerprint、limits、next steps 这五件事，不能因为“不是已知样例”而退化成泛泛描述
+- 默认直接使用本 skill 内嵌的实现原理摘要，不要把“先去读仓库源码”作为分析前置步骤；只有在用户明确要求校验最新实现差异时，才回头读取代码
